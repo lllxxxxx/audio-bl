@@ -85,17 +85,22 @@ class AudioRECollator:
                 texts.append(text)
         
         # 使用processor处理音频和文本
+        # 获取采样率（Qwen2-Audio 使用 16000Hz）
+        sampling_rate = getattr(self.processor.feature_extractor, 'sampling_rate', 16000)
+        
         try:
             inputs = self.processor(
                 text=texts,
-                audios=audios,
+                audio=audios,  # 参数名是 audio 而非 audios
+                sampling_rate=sampling_rate,
                 return_tensors="pt",
                 padding=True,
-                truncation=True,
-                max_length=self.max_length
             )
         except Exception as e:
             print(f"Error processing batch: {e}")
+            print(f"  Number of audios: {len(audios)}")
+            print(f"  Audio shapes: {[a.shape for a in audios]}")
+            print(f"  Sampling rate: {sampling_rate}")
             # 返回空批次
             return None
         

@@ -466,25 +466,29 @@ class Trainer:
         if not self.swanlab_run or not predictions:
             return
         
-        # 构建表格数据
+        # 将预测结果格式化为文本记录（swanlab.Table 在当前版本不可用）
         import swanlab
         
-        table_data = []
+        # 构建文本格式的预测结果
+        prediction_lines = []
         for pred in predictions:
-            table_data.append([
-                pred['id'],
-                pred['ground_truth'],
-                pred['prediction'],
-                str(pred['correct'])
-            ])
+            status = "✓" if pred['correct'] else "✗"
+            prediction_lines.append(
+                f"[{status}] ID: {pred['id']}\n"
+                f"  GT: {pred['ground_truth']}\n"
+                f"  Pred: {pred['prediction']}"
+            )
         
-        # 使用SwanLab的Table记录
-        table = swanlab.Table(
-            columns=["ID", "Ground Truth", "Prediction", "Correct"],
-            data=table_data
-        )
+        prediction_text = "\n\n".join(prediction_lines)
         
-        self.swanlab_run.log({"predictions": table})
+        # 使用 swanlab.Text 记录预测样本
+        try:
+            self.swanlab_run.log({
+                "predictions": swanlab.Text(prediction_text)
+            })
+        except Exception as e:
+            # 如果 swanlab.Text 也不可用，直接记录为字符串
+            print(f"Warning: Could not log predictions to SwanLab: {e}")
     
     def _save_checkpoint(self, epoch: int, eval_results: dict, is_best: bool = False):
         """保存检查点"""

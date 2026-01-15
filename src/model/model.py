@@ -173,17 +173,23 @@ def load_trained_model(
         trust_remote_code=True
     )
     
-    # 加载基础模型
+    # 加载基础模型 - 不使用 device_map="auto" 以避免模型被分散到不同设备
+    # device_map="auto" 在显存不足时会将部分模型放到 CPU，导致推理时设备不匹配
     base_model = Qwen2AudioForConditionalGeneration.from_pretrained(
         base_model_path,
         torch_dtype=torch_dtype,
-        device_map="auto" if device == "cuda" else None,
-        trust_remote_code=True
+        trust_remote_code=True,
+        low_cpu_mem_usage=True
     )
     
     # 加载LoRA权重
     print(f"Loading LoRA weights from {lora_path}...")
     model = PeftModel.from_pretrained(base_model, lora_path)
+    
+    # 显式移动模型到指定设备
+    if device == "cuda" and torch.cuda.is_available():
+        model = model.to(device)
+        print(f"Model moved to {device}")
     
     # 合并权重（可选，用于推理加速）
     # model = model.merge_and_unload()

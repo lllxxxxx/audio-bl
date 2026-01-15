@@ -43,6 +43,9 @@ def load_model_and_processor(
         trust_remote_code=True
     )
     
+    # 训练时不需要缓存，如果不关闭会有警告且可能影响梯度检查点
+    model.config.use_cache = False
+    
     # 获取tokenizer
     tokenizer = processor.tokenizer
     
@@ -98,6 +101,9 @@ def apply_lora(model, lora_config: Optional[dict] = None):
     
     # 启用梯度检查点以节省内存
     model.gradient_checkpointing_enable()
+    
+    # 启用输入梯度（梯度检查点需要）
+    model.enable_input_require_grads()
     
     # 应用PEFT
     model = get_peft_model(model, peft_config)

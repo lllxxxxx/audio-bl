@@ -8,10 +8,10 @@
 export CUDA_VISIBLE_DEVICES="0"
 
 # SwanLab API Key (从 https://swanlab.cn 获取)
-export SWANLAB_API_KEY="your_swanlab_api_key_here"
+export SWANLAB_API_KEY="EcJUnP1993IKCvYXbXxJo"
 
 # 模型路径
-MODEL_PATH="Qwen/Qwen2-Audio-7B-Instruct"
+MODEL_PATH="/root/autodl-tmp/Qwen"
 
 # 数据配置
 DATA_DIR="./conll04"
@@ -21,9 +21,9 @@ DATASET="conll04"
 OUTPUT_DIR="./output"
 
 # 训练超参数
-EPOCHS=10
-BATCH_SIZE=1
-LEARNING_RATE=1e-4
+EPOCHS=6
+BATCH_SIZE=4
+LEARNING_RATE=5e-5
 GRADIENT_ACCUMULATION=8
 
 # SwanLab 项目配置
@@ -83,7 +83,7 @@ if [ $? -eq 0 ]; then
     echo "  Test predictions: $OUTPUT_DIR/test_predictions.json"
     echo "  Test metrics: $OUTPUT_DIR/test_metrics.json"
     echo ""
-    
+
     # 显示测试结果
     if [ -f "$OUTPUT_DIR/test_metrics.json" ]; then
         echo "Test Results:"

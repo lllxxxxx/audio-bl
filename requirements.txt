@@ -1,0 +1,14 @@
+# Qwen2-Audio Speech Relation Extraction
+
+torch>=2.0.0
+transformers>=4.40.0
+peft>=0.10.0
+librosa>=0.10.0
+soundfile>=0.12.1
+pandas>=2.0.0
+numpy>=1.24.0
+tqdm>=4.65.0
+swanlab>=0.3.0
+accelerate>=0.28.0
+bitsandbytes>=0.43.0
+scipy>=1.10.0

@@ -162,6 +162,9 @@ def train(args):
     print("Testing Best Model on Test Set")
     print("="*60)
     
+    # 保存最佳F1分数，稍后用于打印
+    best_dev_f1 = trainer.best_f1
+    
     # 释放训练模型占用的显存
     print("Releasing training model from GPU memory...")
     del model
@@ -205,7 +208,7 @@ def train(args):
     print("Training and Evaluation Completed!")
     print("="*60)
     print(f"Best model saved at: {best_model_path}")
-    print(f"Best dev Micro-F1: {trainer.best_f1:.4f}")
+    print(f"Best dev Micro-F1: {best_dev_f1:.4f}")
     print(f"Test Micro-F1: {test_metrics['micro_f1']:.4f}")
 
 

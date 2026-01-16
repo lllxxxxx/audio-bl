@@ -162,6 +162,17 @@ def train(args):
     print("Testing Best Model on Test Set")
     print("="*60)
     
+    # 释放训练模型占用的显存
+    print("Releasing training model from GPU memory...")
+    del model
+    del trainer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    import gc
+    gc.collect()
+    print("GPU memory released.")
+    
     # 重新加载最佳模型
     print(f"Loading best model from: {best_model_path}")
     best_model, _, _ = load_trained_model(

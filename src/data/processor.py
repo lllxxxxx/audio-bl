@@ -107,7 +107,71 @@ class AudioRECollator:
         # 添加labels用于训练
         if self.is_training:
             labels = inputs.input_ids.clone()
-            # 将padding token设为-100
+            
+            # 关键修复：不仅mask padding，还要mask掉prompt部分
+            # 只对assistant的回复计算loss
+            for i in range(labels.size(0)):
+                input_ids = inputs.input_ids[i].tolist()
+                
+                # 找到assistant回复的起始位置
+                # Qwen2的格式是 <|im_start|>assistant\n ... <|im_end|>
+                # 需要找到 "assistant" 后的内容开始位置
+                
+                # 方法1：找 <|im_start|>assistant 的位置
+                # assistant token的id
+                try:
+                    # 尝试找assistant标记
+                    # Qwen2格式: ...<|im_start|>assistant\n{content}<|im_end|>
+                    text_decoded = self.tokenizer.decode(input_ids)
+                    
+                    # 找到最后一个 assistant 出现的位置（因为可能有多轮对话）
+                    # 我们要找 <|im_start|>assistant\n 之后的内容
+                    assistant_marker = "<|im_start|>assistant\n"
+                    
+                    # 先找到assistant在原始text中的位置
+                    idx = text_decoded.rfind(assistant_marker)
+                    if idx != -1:
+                        # 计算 assistant marker 之前的文本
+                        prompt_text = text_decoded[:idx + len(assistant_marker)]
+                        # 编码来获取token数量
+                        prompt_tokens = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+                        prompt_length = len(prompt_tokens)
+                        
+                        # mask掉prompt部分
+                        labels[i, :prompt_length] = -100
+                    else:
+                        # 如果找不到assistant标记，使用备用方法
+                        # 找 <|im_start|>assistant 的token序列
+                        # im_start token id
+                        im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+                        
+                        # 遍历找到最后一个 im_start 后跟 assistant 的位置
+                        assistant_start = -1
+                        for j in range(len(input_ids) - 1):
+                            if input_ids[j] == im_start_id:
+                                # 检查后面是否是 assistant
+                                next_tokens = self.tokenizer.decode([input_ids[j+1]] if j+1 < len(input_ids) else [])
+                                if 'assistant' in next_tokens.lower():
+                                    assistant_start = j
+                        
+                        if assistant_start != -1:
+                            # 找到assistant\n后的第一个内容token
+                            # 通常是 im_start, assistant, \n, 然后是内容
+                            content_start = assistant_start + 3  # 跳过 im_start, assistant, \n
+                            labels[i, :content_start] = -100
+                        else:
+                            # 最后的备用方案：只mask掉一半（假设前一半是prompt）
+                            seq_len = (labels[i] != self.tokenizer.pad_token_id).sum().item()
+                            labels[i, :seq_len // 2] = -100
+                    
+                except Exception as e:
+                    # 出错时使用简单的启发式方法
+                    # 假设prompt占序列的前60%
+                    seq_len = (labels[i] != self.tokenizer.pad_token_id).sum().item()
+                    prompt_len = int(seq_len * 0.6)
+                    labels[i, :prompt_len] = -100
+            
+            # 仍然要mask padding token
             labels[labels == self.tokenizer.pad_token_id] = -100
             inputs['labels'] = labels
         

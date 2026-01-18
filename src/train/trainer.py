@@ -1,11 +1,15 @@
 """
 训练模块 - 自定义训练循环
 包含训练tricks: 权重衰减过滤、Cosine预热LR、Embedding噪声(NEFTune)
+支持解耦鲁棒性框架 (Decoupled Robustness Framework):
+- BCL: 边界感知对比学习 (Boundary-aware Contrastive Learning)
+- RDH: 反思性去幻觉 (Reflective De-Hallucination)
 """
 import os
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm import tqdm
 from typing import Optional, Dict, Any, List, Tuple
@@ -186,6 +190,7 @@ class Trainer:
     - NEFTune embedding噪声
     - 梯度范数记录
     - 分数epoch记录
+    - 解耦鲁棒性框架 (BCL + RDH)
     """
     
     def __init__(
@@ -220,6 +225,13 @@ class Trainer:
         
         # 设备
         self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+        
+        # 解耦鲁棒性框架配置
+        self.use_bcl = getattr(config, 'use_bcl', False)
+        self.use_rdh = getattr(config, 'use_rdh', False)
+        self.lambda_bcl = getattr(config, 'lambda_bcl', 0.1)
+        self.lambda_rdh = getattr(config, 'lambda_rdh', 0.1)
+        self.bcl_margin = getattr(config, 'bcl_margin', 0.5)
         
         # 参数分组 (LayerNorm和bias不使用weight decay)
         optimizer_grouped_parameters = get_parameter_groups(
@@ -269,6 +281,12 @@ class Trainer:
         print(f"  LR schedule: Cosine with warmup")
         print(f"  Weight decay: {config.weight_decay} (excluded for LayerNorm/bias)")
         print(f"  NEFTune: {'Enabled' if self.neftune_hook else 'Disabled'}")
+        print(f"  BCL (Boundary-aware Contrastive Learning): {'Enabled' if self.use_bcl else 'Disabled'}")
+        print(f"  RDH (Reflective De-Hallucination): {'Enabled' if self.use_rdh else 'Disabled'}")
+        if self.use_bcl:
+            print(f"    BCL lambda: {self.lambda_bcl}, margin: {self.bcl_margin}")
+        if self.use_rdh:
+            print(f"    RDH lambda: {self.lambda_rdh}")
     
 
         
@@ -288,27 +306,38 @@ class Trainer:
             print(f"{'='*50}")
             
             # 训练一个epoch
-            train_loss = self._train_epoch(epoch)
+            train_metrics = self._train_epoch(epoch)
             
             # 每个epoch结束后在dev上验证
             print(f"\nValidating on dev set...")
             eval_results = self._evaluate(epoch)
             
             print(f"\nEpoch {epoch + 1} Summary:")
-            print(f"  Train Loss: {train_loss:.4f}")
+            print(f"  Train Loss (Total): {train_metrics['total_loss']:.4f}")
+            if self.use_bcl:
+                print(f"  Train Loss (SFT): {train_metrics['sft_loss']:.4f}")
+                print(f"  Train Loss (BCL): {train_metrics['bcl_loss']:.4f}")
+            if self.use_rdh:
+                print(f"  Train Loss (RDH): {train_metrics['rdh_loss']:.4f}")
             print(f"  Eval Precision: {eval_results['precision']:.4f}")
             print(f"  Eval Recall: {eval_results['recall']:.4f}")
             print(f"  Eval Micro-F1: {eval_results['micro_f1']:.4f}")
             
             # 记录到SwanLab
             if self.swanlab_run:
-                self.swanlab_run.log({
+                log_dict = {
                     "epoch": epoch + 1,
-                    "train/epoch_loss": train_loss,
+                    "train/epoch_loss": train_metrics['total_loss'],
                     "eval/precision": eval_results['precision'],
                     "eval/recall": eval_results['recall'],
                     "eval/micro_f1": eval_results['micro_f1']
-                })
+                }
+                if self.use_bcl:
+                    log_dict["train/epoch_sft_loss"] = train_metrics['sft_loss']
+                    log_dict["train/epoch_bcl_loss"] = train_metrics['bcl_loss']
+                if self.use_rdh:
+                    log_dict["train/epoch_rdh_loss"] = train_metrics['rdh_loss']
+                self.swanlab_run.log(log_dict)
             
             # 保存最佳模型
             if eval_results['micro_f1'] > self.best_f1:
@@ -333,10 +362,179 @@ class Trainer:
                 total_norm += param_norm.item() ** 2
         return total_norm ** 0.5
     
-    def _train_epoch(self, epoch: int) -> float:
-        """训练一个epoch"""
+
+    
+    def _extract_bcl_hidden_states(
+        self,
+        pos_entities: List[str],
+        neg_entities: List[str]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        提取 BCL 正负样本的 hidden states
+        
+        使用 Teacher Forcing 模式：将正确/错误边界文本作为输入，
+        提取解码器的 hidden state 用于对比学习。
+        
+        关键约束：不计算 CE Loss
+        注意：仅使用纯文本 encoding，不传入 audio features
+        
+        Args:
+            pos_entities: 正确边界实体列表
+            neg_entities: 错误边界实体列表  
+            
+        Returns:
+            (h_pos, h_neg): 正负样本的 hidden states
+        """
+        batch_size = len(pos_entities)
+        
+        # 编码正样本
+        pos_encoded = self.tokenizer(
+            pos_entities,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=64
+        )
+        pos_ids = pos_encoded.input_ids.to(self.device)
+        pos_mask = pos_encoded.attention_mask.to(self.device)
+        
+        # 编码负样本
+        neg_encoded = self.tokenizer(
+            neg_entities,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=64
+        )
+        neg_ids = neg_encoded.input_ids.to(self.device)
+        neg_mask = neg_encoded.attention_mask.to(self.device)
+        
+        # 正样本 forward (需要梯度)
+        pos_inputs = {
+            'input_ids': pos_ids,
+            'attention_mask': pos_mask,
+            'output_hidden_states': True,
+        }
+            
+        outputs_pos = self.model(**pos_inputs)
+        
+        # 负样本 forward (需要梯度)
+        neg_inputs = {
+            'input_ids': neg_ids,
+            'attention_mask': neg_mask,
+            'output_hidden_states': True,
+        }
+            
+        outputs_neg = self.model(**neg_inputs)
+        
+        # 提取最后一个 token 的 hidden state
+        pos_hidden = outputs_pos.hidden_states[-1]  # [batch, seq_len, hidden_dim]
+        neg_hidden = outputs_neg.hidden_states[-1]
+        
+        pos_lengths = pos_mask.sum(dim=1) - 1
+        neg_lengths = neg_mask.sum(dim=1) - 1
+        
+        h_pos = pos_hidden[
+            torch.arange(batch_size, device=pos_ids.device),
+            pos_lengths.long().clamp(min=0)
+        ]
+        h_neg = neg_hidden[
+            torch.arange(batch_size, device=neg_ids.device),
+            neg_lengths.long().clamp(min=0)
+        ]
+        
+        return h_pos, h_neg
+    
+    def _get_audio_anchor_representation(
+        self,
+        outputs,
+        input_features: torch.Tensor,
+        feature_attention_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        获取音频的 anchor 表示
+        
+        从模型输出中提取音频相关的表示，用于 BCL 对比学习
+        
+        Args:
+            outputs: 模型输出
+            input_features: 音频特征
+            feature_attention_mask: 音频特征注意力掩码
+            
+        Returns:
+            音频 anchor 表示 [batch_size, hidden_dim]
+        """
+        # 使用最后一层 hidden states 的音频部分
+        # 由于 Qwen2-Audio 的特殊架构，音频特征会被编码到 hidden states 中
+        # 这里我们使用一个简化的方法：取 hidden states 的平均作为 anchor
+        
+        if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+            last_hidden_states = outputs.hidden_states[-1]  # [batch, seq_len, hidden_dim]
+            # 对序列维度取平均作为 anchor
+            audio_anchor = last_hidden_states.mean(dim=1)  # [batch, hidden_dim]
+        else:
+            # 如果没有 hidden_states，使用 input_features 的平均
+            # 这是一个 fallback 方案
+            if input_features.dim() == 3:
+                audio_anchor = input_features.mean(dim=1)  # [batch, hidden_dim]
+            else:
+                audio_anchor = input_features.mean(dim=-1)
+        
+        return audio_anchor
+    
+    def _compute_bcl_loss(
+        self,
+        audio_anchor: torch.Tensor,
+        h_pos: torch.Tensor,
+        h_neg: torch.Tensor,
+        margin: float = 0.5
+    ) -> torch.Tensor:
+        """
+        计算边界感知对比学习 (BCL) 的 Margin Ranking Loss
+        
+        Loss = max(0, margin - sim(anchor, pos) + sim(anchor, neg))
+        
+        目标：让正样本比负样本更接近音频 anchor
+        
+        Args:
+            audio_anchor: 音频表示 [batch, hidden_dim]
+            h_pos: 正样本 (正确边界) hidden state [batch, hidden_dim]
+            h_neg: 负样本 (错误边界) hidden state [batch, hidden_dim]
+            margin: margin 值
+            
+        Returns:
+            BCL loss (标量)
+        """
+        # 计算余弦相似度
+        sim_pos = F.cosine_similarity(audio_anchor, h_pos, dim=-1)  # [batch]
+        sim_neg = F.cosine_similarity(audio_anchor, h_neg, dim=-1)  # [batch]
+        
+        # Margin Ranking Loss
+        # 我们希望 sim_pos > sim_neg，即 sim_pos - sim_neg > margin
+        # 使用 margin_ranking_loss: loss = max(0, -y * (x1 - x2) + margin)
+        # 当 y=1 时，loss = max(0, -(x1 - x2) + margin) = max(0, margin - x1 + x2)
+        # 这里 x1 = sim_pos, x2 = sim_neg
+        target = torch.ones_like(sim_pos)  # y = 1
+        loss = F.margin_ranking_loss(sim_pos, sim_neg, target, margin=margin)
+        
+        return loss
+    
+    def _train_epoch(self, epoch: int) -> Dict[str, float]:
+        """
+        训练一个epoch
+        
+        实现三流训练:
+        - 流 1: 标准 SFT (CE Loss)
+        - 流 2: BCL 边界对比学习 (Margin Ranking Loss, 不计算 CE Loss)
+        - 流 3: RDH 反思性去幻觉 (CE Loss)
+        """
         self.model.train()
-        total_loss = 0.0
+        
+        # 分别累积各项 loss
+        total_loss_sum = 0.0
+        sft_loss_sum = 0.0
+        bcl_loss_sum = 0.0
+        rdh_loss_sum = 0.0
         num_batches = 0
         accumulated_loss = 0.0
         
@@ -348,39 +546,129 @@ class Trainer:
             if batch is None:
                 continue
             
-            # 移动到设备
+            # ============== 流 1: 标准 SFT ==============
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             labels = batch.get('labels')
             if labels is not None:
                 labels = labels.to(self.device)
             
-            # 处理其他可能的输入
             model_inputs = {
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
-                'labels': labels
+                'labels': labels,
+                'output_hidden_states': self.use_bcl  # BCL 需要 hidden states
             }
             
-            # 添加音频特征（如果有）
+            # 添加音频特征
+            input_features = None
+            feature_attention_mask = None
             if 'input_features' in batch:
-                model_inputs['input_features'] = batch['input_features'].to(self.device)
+                input_features = batch['input_features'].to(self.device)
+                model_inputs['input_features'] = input_features
             if 'feature_attention_mask' in batch:
-                model_inputs['feature_attention_mask'] = batch['feature_attention_mask'].to(self.device)
+                feature_attention_mask = batch['feature_attention_mask'].to(self.device)
+                model_inputs['feature_attention_mask'] = feature_attention_mask
             
-            # 前向传播 (bf16)
+            # SFT 前向传播
             if self.config.bf16 and torch.cuda.is_available():
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    outputs = self.model(**model_inputs)
-                    loss = outputs.loss / self.config.gradient_accumulation_steps
+                    outputs_sft = self.model(**model_inputs)
+                    loss_sft = outputs_sft.loss
             else:
-                outputs = self.model(**model_inputs)
-                loss = outputs.loss / self.config.gradient_accumulation_steps
+                outputs_sft = self.model(**model_inputs)
+                loss_sft = outputs_sft.loss
             
-            loss.backward()
+            total_loss = loss_sft
+            current_sft_loss = loss_sft.item()
+            current_bcl_loss = 0.0
+            current_rdh_loss = 0.0
             
-            accumulated_loss += loss.item() * self.config.gradient_accumulation_steps
-            total_loss += loss.item() * self.config.gradient_accumulation_steps
+            # ============== 流 2: BCL (边界对比学习) ==============
+            # BCL 目标: 让正确边界的特征比错误边界更接近音频 anchor
+            # 关键: 不计算 CE Loss，只提取特征用于 Margin Ranking Loss
+            if self.use_bcl and 'bcl_pos_entities' in batch and 'bcl_neg_entities' in batch:
+                try:
+                    bcl_pos_entities = batch['bcl_pos_entities']
+                    bcl_neg_entities = batch['bcl_neg_entities']
+                    
+                    # 提取正负样本的 hidden states (Teacher Forcing, 无 CE Loss)
+                    # 梯度会通过 h_pos 和 h_neg 反向传播更新模型
+                    # 注意: BCL 实体是纯文本，不需要 input_features (避免 shape 错误)
+                    h_pos, h_neg = self._extract_bcl_hidden_states(
+                        bcl_pos_entities, 
+                        bcl_neg_entities
+                    )
+                    
+                    # 获取音频 anchor 表示 (从 SFT forward 中获取，detach 避免重复梯度)
+                    audio_anchor = self._get_audio_anchor_representation(
+                        outputs_sft, input_features, feature_attention_mask
+                    ).detach()  # anchor 不参与梯度更新，只作为固定参照
+                    
+                    # 计算 BCL Margin Ranking Loss
+                    # 目标: sim(anchor, h_pos) > sim(anchor, h_neg) + margin
+                    loss_bcl = self._compute_bcl_loss(
+                        audio_anchor,
+                        h_pos,  # 有梯度
+                        h_neg,  # 有梯度
+                        margin=self.bcl_margin
+                    )
+                    
+                    total_loss = total_loss + self.lambda_bcl * loss_bcl
+                    current_bcl_loss = loss_bcl.item()
+                    
+                except Exception as e:
+                    # BCL 失败时跳过
+                    if step == 0:
+                        print(f"Warning: BCL computation failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
+            # ============== 流 3: RDH (反思性去幻觉) ==============
+            if self.use_rdh and batch.get('rdh_input_ids') is not None:
+                try:
+                    rdh_input_ids = batch['rdh_input_ids'].to(self.device)
+                    rdh_attention_mask = batch['rdh_attention_mask'].to(self.device)
+                    rdh_labels = batch['rdh_labels'].to(self.device)
+                    
+                    rdh_model_inputs = {
+                        'input_ids': rdh_input_ids,
+                        'attention_mask': rdh_attention_mask,
+                        'labels': rdh_labels  # 正确实体作为 label (CE Loss)
+                    }
+                    
+                    # 添加 RDH 音频特征
+                    if 'rdh_input_features' in batch:
+                        rdh_model_inputs['input_features'] = batch['rdh_input_features'].to(self.device)
+                    if 'rdh_feature_attention_mask' in batch:
+                        rdh_model_inputs['feature_attention_mask'] = batch['rdh_feature_attention_mask'].to(self.device)
+                    
+                    # RDH 前向传播 (正常 CE Loss)
+                    if self.config.bf16 and torch.cuda.is_available():
+                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                            outputs_rdh = self.model(**rdh_model_inputs)
+                            loss_rdh = outputs_rdh.loss
+                    else:
+                        outputs_rdh = self.model(**rdh_model_inputs)
+                        loss_rdh = outputs_rdh.loss
+                    
+                    total_loss = total_loss + self.lambda_rdh * loss_rdh
+                    current_rdh_loss = loss_rdh.item()
+                    
+                except Exception as e:
+                    # RDH 失败时跳过
+                    if step == 0:
+                        print(f"Warning: RDH computation failed: {e}")
+            
+            # ============== 反向传播 ==============
+            scaled_loss = total_loss / self.config.gradient_accumulation_steps
+            scaled_loss.backward()
+            
+            accumulated_loss += total_loss.item()
+            total_loss_sum += total_loss.item()
+            sft_loss_sum += current_sft_loss
+            bcl_loss_sum += current_bcl_loss
+            rdh_loss_sum += current_rdh_loss
             num_batches += 1
             
             # 梯度累积完成，进行优化步骤
@@ -410,20 +698,28 @@ class Trainer:
                     avg_loss = accumulated_loss / self.config.gradient_accumulation_steps
                     lr = self.scheduler.get_last_lr()[0]
                     
-                    progress_bar.set_postfix({
+                    postfix_dict = {
                         'loss': f'{avg_loss:.4f}',
                         'lr': f'{lr:.2e}',
-                        'grad_norm': f'{grad_norm:.2f}'
-                    })
+                    }
+                    if self.config.log_grad_norm:
+                        postfix_dict['grad_norm'] = f'{grad_norm:.2f}'
+                    
+                    progress_bar.set_postfix(postfix_dict)
                     
                     if self.swanlab_run:
                         log_dict = {
                             "train/loss": avg_loss,
+                            "train/loss_sft": current_sft_loss,
                             "train/learning_rate": lr,
                             "train/global_step": self.global_step,
                             "train/epoch": round(fractional_epoch, 2),
                         }
                         
+                        if self.use_bcl:
+                            log_dict["train/loss_bcl"] = current_bcl_loss
+                        if self.use_rdh:
+                            log_dict["train/loss_rdh"] = current_rdh_loss
                         if self.config.log_grad_norm:
                             log_dict["train/grad_norm"] = grad_norm
                         
@@ -432,7 +728,14 @@ class Trainer:
                 # 重置累积损失
                 accumulated_loss = 0.0
         
-        return total_loss / max(num_batches, 1)
+        # 返回各项 loss 的平均值
+        num_batches = max(num_batches, 1)
+        return {
+            'total_loss': total_loss_sum / num_batches,
+            'sft_loss': sft_loss_sum / num_batches,
+            'bcl_loss': bcl_loss_sum / num_batches if self.use_bcl else 0.0,
+            'rdh_loss': rdh_loss_sum / num_batches if self.use_rdh else 0.0
+        }
     
     def _evaluate(self, epoch: int) -> Dict[str, float]:
         """评估模型"""
@@ -514,7 +817,12 @@ class Trainer:
                 'weight_decay': self.config.weight_decay,
                 'warmup_ratio': self.config.warmup_ratio,
                 'use_neftune': getattr(self.config, 'use_neftune', True),
-                'neftune_noise_alpha': getattr(self.config, 'neftune_noise_alpha', 5.0)
+                'neftune_noise_alpha': getattr(self.config, 'neftune_noise_alpha', 5.0),
+                'use_bcl': self.use_bcl,
+                'lambda_bcl': self.lambda_bcl,
+                'bcl_margin': self.bcl_margin,
+                'use_rdh': self.use_rdh,
+                'lambda_rdh': self.lambda_rdh
             }
         }
         

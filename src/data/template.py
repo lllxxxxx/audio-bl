@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 
 
+# RDH (Reflective De-Hallucination) 专用模板
+# 用于训练模型纠正错误实体
+RDH_REFLECTIVE_PROMPT = 'I detected a potential error in the extracted entity: "{noisy_entity}". Based on the audio, check and output the corrected entity string.'
+
+
 @dataclass
 class DatasetTemplate:
     """数据集模板基类"""

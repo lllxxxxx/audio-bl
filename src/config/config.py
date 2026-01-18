@@ -65,6 +65,16 @@ class TrainingConfig:
     use_neftune: bool = True
     neftune_noise_alpha: float = 5.0
 
+    # 解耦鲁棒性框架配置 (Decoupled Robustness Framework)
+    # BCL - 边界感知对比学习 (Boundary-aware Contrastive Learning)
+    use_bcl: bool = True
+    lambda_bcl: float = 0.1  # BCL loss 权重
+    bcl_margin: float = 0.5  # Margin Ranking Loss 的 margin 值
+    
+    # RDH - 反思性去幻觉 (Reflective De-Hallucination)
+    use_rdh: bool = True
+    lambda_rdh: float = 0.1  # RDH loss 权重
+
     # 设备配置
     device: str = "cuda"
 

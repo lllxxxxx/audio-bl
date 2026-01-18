@@ -118,7 +118,9 @@ def train(args):
         tokenizer=tokenizer,
         template=template,
         max_length=config.max_length,
-        is_training=True
+        is_training=True,
+        use_bcl=config.use_bcl,
+        use_rdh=config.use_rdh
     )
     
     eval_collator = AudioRECollator(

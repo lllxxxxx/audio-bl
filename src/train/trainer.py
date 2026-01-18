@@ -262,9 +262,6 @@ class Trainer:
         # 每个epoch的step数
         self.steps_per_epoch = len(train_loader) // config.gradient_accumulation_steps
         
-        # 初始化三维度增强模块
-        self.enhancements = self._init_enhancements()
-        
         print(f"\nTrainer initialized:")
         print(f"  Total optimization steps: {self.total_steps}")
         print(f"  Warmup steps: {warmup_steps}")
@@ -272,101 +269,8 @@ class Trainer:
         print(f"  LR schedule: Cosine with warmup")
         print(f"  Weight decay: {config.weight_decay} (excluded for LayerNorm/bias)")
         print(f"  NEFTune: {'Enabled' if self.neftune_hook else 'Disabled'}")
-        print(f"  Enhancements: {list(self.enhancements.keys()) if self.enhancements else 'None'}")
     
-    def _init_enhancements(self):
-        """初始化三维度增强模块，根据config决定是否启用"""
-        enhancements = {}
-        
-        # 维度1: 专有名词识别增强
-        if getattr(self.config, 'use_entity_aware', False):
-            try:
-                from src.enhancement.entity_aware import EntityAwareEnhancement
-                # 获取模型的hidden_size
-                hidden_size = getattr(self.model.config, 'hidden_size', 4096)
-                enhancements['entity_aware'] = EntityAwareEnhancement(
-                    hidden_size=hidden_size,
-                    entity_boost=getattr(self.config, 'entity_boost_factor', 1.5)
-                ).to(self.device)
-                print(f"  Entity-Aware Enhancement: Enabled")
-            except Exception as e:
-                print(f"  Warning: Failed to init Entity-Aware Enhancement: {e}")
-        
-        # 维度2: 实体边界约束
-        if getattr(self.config, 'use_boundary_loss', False):
-            try:
-                from src.enhancement.boundary_loss import BoundaryContrastiveLoss
-                hidden_size = getattr(self.model.config, 'hidden_size', 4096)
-                enhancements['boundary'] = BoundaryContrastiveLoss(
-                    margin=getattr(self.config, 'boundary_margin', 1.0),
-                    hidden_size=hidden_size
-                )
-                print(f"  Boundary Contrastive Loss: Enabled")
-            except Exception as e:
-                print(f"  Warning: Failed to init Boundary Loss: {e}")
-        
-        # 维度3: 幻觉抑制
-        if getattr(self.config, 'use_grounding_loss', False):
-            try:
-                from src.enhancement.grounding_loss import GroundingConstraintLoss
-                enhancements['grounding'] = GroundingConstraintLoss(
-                    threshold=getattr(self.config, 'grounding_threshold', 0.1)
-                )
-                print(f"  Grounding Constraint Loss: Enabled")
-            except Exception as e:
-                print(f"  Warning: Failed to init Grounding Loss: {e}")
-        
-        return enhancements
-    
-    def _compute_enhancement_losses(self, batch, outputs):
-        """计算增强损失（与SFT loss分离）"""
-        enhancement_losses = {}
-        
-        # 维度1: Entity-Aware Loss
-        if 'entity_aware' in self.enhancements:
-            try:
-                # 需要entity_mask从batch中获取
-                entity_mask = batch.get('entity_mask')
-                if entity_mask is not None and hasattr(outputs, 'hidden_states') and outputs.hidden_states:
-                    entity_mask = entity_mask.to(self.device)
-                    # 使用最后一层hidden states
-                    hidden_states = outputs.hidden_states[-1]
-                    _, entity_prob = self.enhancements['entity_aware'](hidden_states)
-                    enhancement_losses['entity_aware'] = self.enhancements['entity_aware'].compute_loss(
-                        entity_prob, entity_mask
-                    )
-            except Exception as e:
-                pass  # 静默失败，不影响主训练
-        
-        # 维度2: Boundary Contrastive Loss
-        if 'boundary' in self.enhancements:
-            try:
-                gold_triplets = batch.get('triplets', [])
-                context_texts = batch.get('ground_truth_texts', [])
-                if gold_triplets and context_texts and hasattr(outputs, 'hidden_states') and outputs.hidden_states:
-                    # 使用最后一层hidden states的平均作为audio embedding
-                    audio_embed = outputs.hidden_states[-1].mean(dim=1)
-                    enhancement_losses['boundary'] = self.enhancements['boundary'].compute_loss(
-                        audio_embed, gold_triplets, context_texts,
-                        self.tokenizer, self.model, self.device
-                    )
-            except Exception as e:
-                pass
-        
-        # 维度3: Grounding Constraint Loss
-        if 'grounding' in self.enhancements:
-            try:
-                entity_positions = batch.get('entity_positions', [])
-                if entity_positions and hasattr(outputs, 'cross_attentions') and outputs.cross_attentions:
-                    # 使用cross attention
-                    cross_attn = outputs.cross_attentions[-1]  # 最后一层
-                    enhancement_losses['grounding'] = self.enhancements['grounding'].compute_loss(
-                        cross_attn, entity_positions
-                    )
-            except Exception as e:
-                pass
-        
-        return enhancement_losses
+
         
     def train(self):
         """执行训练"""
@@ -464,37 +368,14 @@ class Trainer:
             if 'feature_attention_mask' in batch:
                 model_inputs['feature_attention_mask'] = batch['feature_attention_mask'].to(self.device)
             
-            # 如果启用了增强模块，需要输出hidden_states和attentions
-            if self.enhancements:
-                model_inputs['output_hidden_states'] = True
-                model_inputs['output_attentions'] = True
-            
             # 前向传播 (bf16)
             if self.config.bf16 and torch.cuda.is_available():
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     outputs = self.model(**model_inputs)
-                    sft_loss = outputs.loss / self.config.gradient_accumulation_steps
+                    loss = outputs.loss / self.config.gradient_accumulation_steps
             else:
                 outputs = self.model(**model_inputs)
-                sft_loss = outputs.loss / self.config.gradient_accumulation_steps
-            
-            # 计算增强损失
-            enhancement_losses = {}
-            total_enhancement_loss = 0.0
-            if self.enhancements:
-                enhancement_losses = self._compute_enhancement_losses(batch, outputs)
-                for name, enh_loss in enhancement_losses.items():
-                    weight = getattr(self.config, f'{name}_weight', 0.1)
-                    if name == 'entity_aware':
-                        weight = getattr(self.config, 'entity_aware_weight', 0.1)
-                    elif name == 'boundary':
-                        weight = getattr(self.config, 'boundary_loss_weight', 0.1)
-                    elif name == 'grounding':
-                        weight = getattr(self.config, 'grounding_loss_weight', 0.1)
-                    total_enhancement_loss += weight * enh_loss
-            
-            # 总损失 = SFT损失 + 增强损失
-            loss = sft_loss + total_enhancement_loss / self.config.gradient_accumulation_steps
+                loss = outputs.loss / self.config.gradient_accumulation_steps
             
             loss.backward()
             

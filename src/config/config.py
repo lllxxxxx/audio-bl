@@ -33,7 +33,7 @@ class TrainingConfig:
     use_lora: bool = True
     lora_rank: int = 64
     lora_alpha: int = 128
-    lora_dropout: float = 0.05
+    lora_dropout: float = 0.06
     lora_target_modules: List[str] = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj"
@@ -41,10 +41,10 @@ class TrainingConfig:
 
     # 输出配置
     output_dir: str = "./output"
-    save_total_limit: int = 3
+    save_total_limit: int = 1
 
     # 日志配置
-    logging_steps: int = 2
+    logging_steps: int = 1
     logging_first_step: bool = True
     log_grad_norm: bool = True
     log_fractional_epoch: bool = True  # 像llamafactory一样记录0.1 epoch
@@ -64,22 +64,6 @@ class TrainingConfig:
     # NEFTune 配置 (Embedding噪声)
     use_neftune: bool = True
     neftune_noise_alpha: float = 5.0
-
-    # ========== 三维度增强配置 ==========
-    # 维度1: 专有名词识别增强 (Entity-Aware Audio Encoding)
-    use_entity_aware: bool = False
-    entity_aware_weight: float = 0.1
-    entity_boost_factor: float = 1.5
-    
-    # 维度2: 实体边界约束 (Boundary Contrastive Learning)
-    use_boundary_loss: bool = False
-    boundary_loss_weight: float = 0.1
-    boundary_margin: float = 1.0
-    
-    # 维度3: 幻觉抑制 (Grounding Constraint Loss)
-    use_grounding_loss: bool = False
-    grounding_loss_weight: float = 0.1
-    grounding_threshold: float = 0.1
 
     # 设备配置
     device: str = "cuda"
